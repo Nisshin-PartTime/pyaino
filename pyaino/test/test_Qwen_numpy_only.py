@@ -4,7 +4,10 @@
 #   2) KVキャッシュ有り逐次計算 == キャッシュ無し一括計算
 #   3) LoRA保存→読込, merge の一致
 #   4) cf.save_parameters / cf.load_parameters による全パラメタの保存・復元
+# 乱数の重み・入力はsafetensorsと同じくホスト側のnumpyで作るので、
+# Config.np が cupy や nlcpy でもそのまま実行できる
 import os, tempfile
+import numpy
 from pyaino.Config import *
 set_dtype('float64')                     # 有限差分のため倍精度
 from pyaino.Qwen import QwenLanguageModel
@@ -19,7 +22,7 @@ def tiny(model_type, seed=0):
                               qk_norm=(model_type == 'qwen3'))
     model.forward(np.zeros((1, 2), dtype=int))   # 遅延初期化を済ませる
     # 全パラメタを再現可能な乱数で設定(gammaは1の周り、biasも非零)
-    rs = np.random.RandomState(seed)
+    rs = numpy.random.RandomState(seed)
     sd = {k: (1.0 if k.endswith('norm.weight') else 0.0) + rs.randn(*v.shape) * 0.3
           for k, v in model.hf_state_dict().items()}
     model.import_hf_weights(sd)
@@ -40,19 +43,21 @@ def check_grads(model, x, t, names, eps=1e-5, n_probe=2):
             p, g = getattr(obj, attr), getattr(obj, gattr)
         g = g.copy()
         for _ in range(n_probe):
-            idx = tuple(np.random.randint(s) for s in p.shape)
-            old = p[idx]
+            idx = tuple(int(rng.integers(s)) for s in p.shape)
+            old = float(p[idx])
             p[idx] = old + eps; lp = float(model.forward(x, t))
             p[idx] = old - eps; lm = float(model.forward(x, t))
             p[idx] = old
             num = (lp - lm) / (2 * eps)
-            err = abs(num - g[idx]) / max(abs(num) + abs(g[idx]), 1e-8)
+            gi = float(g[idx])
+            err = abs(num - gi) / max(abs(num) + abs(gi), 1e-8)
             worst = max(worst, err)
     return worst
 
+rng = numpy.random.default_rng(0)
 for mt in ('qwen2', 'qwen3'):
     model = tiny(mt)
-    ids = np.random.randint(0, 40, (2, 8))
+    ids = np.asarray(rng.integers(0, 40, (2, 8)))
     x, t = ids[:, :-1], ids[:, 1:].copy()
     t[:, :2] = -100
 
@@ -63,7 +68,7 @@ for mt in ('qwen2', 'qwen3'):
     model.apply_lora(r=2, alpha=4, seed=1)
     for k, v in model.lora_parameters().items():
         if k.endswith('lora_B'):
-            v[...] = np.random.randn(*v.shape) * 0.3
+            v[...] = np.asarray(rng.standard_normal(v.shape) * 0.3)
     e_lora = check_grads(model, x, t, list(model.lora_parameters()))
 
     # 2) KVキャッシュ(複数トークンのprefill → offset付き複数トークン → 1トークン)
