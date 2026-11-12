@@ -560,6 +560,8 @@ else: # numpy環境
 
     # ---------- add.at ----------
     def add_at(x, *args, **kwargs):
+        if np.__name__ == 'nlcpy': # numpyのadd.atはnlcpy配列を扱えない
+            return np.add.at(x, *args, **kwargs)
         return _numpy.add.at(_to_numpy(x), *args, **kwargs)
 
     # ---------- erf ----------

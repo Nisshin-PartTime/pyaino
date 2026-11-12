@@ -53,8 +53,10 @@ def set_np(value=None):
         import numpy as np
     elif value == 'cupy':
         import cupy as np
+    elif value == 'nlcpy':      # NEC SX-Aurora TSUBASA (Vector Engine)
+        import nlcpy as np
     else:
-        raise Exception("Invalid library specified. Specify either 'numpy' or 'cupy'.")
+        raise Exception("Invalid library specified. Specify 'numpy', 'cupy' or 'nlcpy'.")
 
     if np.__name__ == 'numpy':
         np.seterr(divide='raise') # 割算例外でnanで続行せずに例外処理させる
@@ -69,7 +71,9 @@ def set_np(value=None):
     inf = np.array(float(Config.inf), dtype=Config.dtype)
     setattr(Config, 'inf', inf)
 
-set_np()
+# 環境変数 PYAINO_NP=numpy|cupy|nlcpy で既定を選べる(未指定ならcupy、無ければnumpy)
+import os as _os
+set_np(_os.environ.get('PYAINO_NP') or None)
 
 #import numpy as np
 
@@ -77,7 +81,7 @@ print(np.__name__, np.__version__, 'is running in', __file__, np.random.rand(1))
 print('Config.dtype =', Config.dtype)
 print('Config.seed =', Config.seed)
 print('Config.create_graph =', Config.create_graph)
-print("If you want to change np, run 'set_np('numpy' or 'cupy'); np = Config.np.'")
+print("If you want to change np, run 'set_np('numpy', 'cupy' or 'nlcpy'); np = Config.np.'")
 print("If you want to change Config.dtype, run 'set_dtype('value')'")
 print("If you want to set seed for np.random, run set_seed(number)")
 print("If you want to set create_graph for Higher Derivative Functions, run set_create_graph(True)")

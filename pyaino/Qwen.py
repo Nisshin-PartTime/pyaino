@@ -834,7 +834,7 @@ class QwenLanguageModel:
         with open(file_name, 'rb') as f:
             params = pickle.load(f)
         lc = params.pop('lora_config')
-        if np.__name__ == 'cupy':
+        if np.__name__ in ('cupy', 'nlcpy'):
             params = cf.n2c_dictionary(params)
         else:
             params = cf.c2n_dictionary(params)

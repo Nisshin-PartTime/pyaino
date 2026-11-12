@@ -19,11 +19,12 @@ class BaseInitializer:
         debug_print('random generator is', self.rng.__class__.__name__)        
 
     def __call__(self, shape, scale):
+        scale = float(scale) # nlcpyは0次元配列の書式指定や乱数の引数への配列を受け付けない
         debug_print(self.__class__.__name__, shape, f'scale={scale:6.4f}', self.distribution)
         if self.distribution == 'normal': 
-            return self.rng.normal(0.0, np.sqrt(scale), size=shape).astype(Config.dtype)
+            return self.rng.normal(0.0, scale ** 0.5, size=shape).astype(Config.dtype)
         elif self.distribution == 'uniform':
-            limit = np.sqrt(3 * scale)
+            limit = (3 * scale) ** 0.5
             return self.rng.uniform(-limit, limit, size=shape).astype(Config.dtype)
         else:
             raise ValueError(f"Unsupported distribution '{self.distribution}' in {self.__class__.__name__}")

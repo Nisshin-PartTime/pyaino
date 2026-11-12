@@ -751,9 +751,9 @@ def c2n_dictionary(parameters):
     """ 辞書に登録されたcupyの値をnumpyに変換する """
     print('c2n_dictionary called on np =', np.__name__)
     def conv(x):
-        if np.__name__=='cupy': # cupy環境
-            if isinstance(x, np.ndarray): # 現npに合致=cupy配列
-                x = np.asnumpy(x)
+        if np.__name__ in ('cupy', 'nlcpy'): # cupy/nlcpy環境
+            if isinstance(x, np.ndarray): # 現npに合致=cupy/nlcpy配列
+                x = x.get()
             else:                         # 現npとは違う=numpy配列
                 pass
         else:                   # numpy環境
@@ -770,8 +770,8 @@ def n2c_dictionary(parameters):
     """ 辞書に登録されたnumpyの値をcupyに変換する """
     print('n2c_dictionary called on np =', np.__name__)
     def conv(x):
-        if np.__name__=='cupy': # cupy環境
-            if isinstance(x, np.ndarray): # 現npに合致=cupy配列
+        if np.__name__ in ('cupy', 'nlcpy'): # cupy/nlcpy環境
+            if isinstance(x, np.ndarray): # 現npに合致=cupy/nlcpy配列
                 pass
             elif x is not None:           # 現npとは違う=numpy配列
                 x = np.array(x)
@@ -824,7 +824,7 @@ def load_parameters(file_name, model, dtype=None, verbose=False):
     with open(file_name, 'rb') as f:
         params = pickle.load(f)
     print('load_parameters called on np =', np.__name__)    
-    if np.__name__=='cupy':
+    if np.__name__ in ('cupy', 'nlcpy'):
         params = n2c_dictionary(params)
     if np.__name__=='numpy':
         params = c2n_dictionary(params)
@@ -2026,7 +2026,7 @@ def select_category(x, stocastic=False, beta=2):
         p = p / np.sum(p)
         y = np.random.choice(len(p), size=1, p=p)
     else:         # 確定的に
-        y = np.argmax(x, keepdims=True)
+        y = np.argmax(x).reshape(1) # keepdimsはnlcpyに無い(xは1次元なので同じ結果)
     return y
 
 ## -- 損失関数 --

@@ -25,8 +25,8 @@ def read_image(filename):
     for i in range(count):
         V[i][:] = unpack('>784B', data[offset:offset+784]) 
         offset += 784     # 784バイトが画像
-    if np.__name__=='cupy':
-        V = np.array(V)   # cupy行列に変換
+    if np.__name__ in ('cupy', 'nlcpy'):
+        V = np.array(V)   # cupy/nlcpy行列に変換
     return V
 
 def read_label(filename):
