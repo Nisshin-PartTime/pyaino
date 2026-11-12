@@ -60,6 +60,8 @@ CURRENT_MODULES = (
     'UNet',
     'ResNet',
     'Markov',
+    'Qwen',
+    'QwenTokenizer',
 
     # datasets / data utilities
     'data_loader',
