@@ -910,7 +910,7 @@ class MatMulLinear(Function):
         
     def __forward__(self, x, w, b):
         self.x, self.w, self.b = x, w, b
-        y = np.matmul(x, w)
+        y = snp.matmul(x, w)
         if self.bias:
             y += b
         return y
@@ -919,7 +919,7 @@ class MatMulLinear(Function):
         x, w, b = self.x, self.w, self.b
         #x_T = x.T if x.ndim <= 2 else x.reshape(-1, x.shape[-1]).T
         x_T = x.T if x.ndim <= 2 else snp.reshape(x, (-1, x.shape[-1])).T
-        gx = np.matmul(gy, w.T)
+        gx = snp.matmul(gy, w.T)
         #gyf = gy.reshape(-1, gy.shape[-1])
         gyf = snp.reshape(gy, (-1, gy.shape[-1]))
         gw = np.dot(x_T, gyf)
@@ -986,7 +986,7 @@ class ScaleDotLinear(Function):
         self.matmul = matmul 
         self.bias = bias
         self.scale = scale
-        self.dot = np.matmul if matmul else np.dot
+        self.dot = snp.matmul if matmul else np.dot # snp.matmulはNLCPyでも高速
         self.eps = eps
         
     def __forward__(self, x, w, b, g=1.0):

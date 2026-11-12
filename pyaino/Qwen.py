@@ -178,7 +178,7 @@ class LinearLayerLoRA(nn.LinearLayer):
 
         if self.frozen: # 入力の勾配だけ(重みの勾配は計算しない)
             w, b, gamma = self.parameters()
-            grad_x = np.matmul(grad_y, w.T)
+            grad_x = snp.matmul(grad_y, w.T)
             self.dot_linear.x = self.dot_linear.y = None # 保持していた入出力を解放
         else:
             grad_x = super().__backward__(grad_y)
@@ -517,7 +517,7 @@ class LinearLayerCrossEntropyTied(Function):
     def __forward__(self, x, t=None):
         w = self.weight()
         if t is None:                         # 推論: logitsを返す
-            return np.matmul(x, w.T)
+            return snp.matmul(x, w.T)
         xf = snp.reshape(x, (-1, x.shape[-1]))
         tf = t.reshape(-1)
         N = xf.shape[0]

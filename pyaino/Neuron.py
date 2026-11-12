@@ -4065,7 +4065,7 @@ class AttentionUnit_bkup(Function):
         v = v.reshape(B,Tv,h,H).transpose(0,2,1,3) # (B,Tv,C)->(B,h,Tv,H)
         k = k.reshape(B,Tk,h,H).transpose(0,2,1,3) # (B,Tk,C)->(B,h,Tk,H)
         q = q.reshape(B,Tq,h,H).transpose(0,2,1,3) # (B,Tq,C)->(B,h,Tq,H)
-        a = np.matmul(q, k.transpose(0,1,3,2))     # (B,h,Tq,H)@(B,h,H,Tk)->(B,h,Tq,Tk)
+        a = snp.matmul(q, k.transpose(0,1,3,2))     # (B,h,Tq,H)@(B,h,H,Tk)->(B,h,Tq,Tk)
         if self.scale:
             a *= np.array(H ** -0.5, dtype=a.dtype)
 
@@ -4097,7 +4097,7 @@ class AttentionUnit_bkup(Function):
         self.iter += 1 
 
         a = self.DO.forward(a, dropout=dropout)
-        y = np.matmul(a, v)            # (B,h,Tq,Tk)@(B,h,Tv,H)->(B,h,Tq,H), Tv=Tk
+        y = snp.matmul(a, v)            # (B,h,Tq,Tk)@(B,h,Tv,H)->(B,h,Tq,H), Tv=Tk
         y = y.transpose(0,2,1,3).reshape(B,Tq,C)     # (B,h,Tq,H)->(B,Tq,C)
         self.k = k                                   # key
         self.q = q                                   # query
@@ -4116,8 +4116,8 @@ class AttentionUnit_bkup(Function):
         B, h, Tv, H = v.shape
         C = h * H
         gy = gy.reshape(B,Tq,h,H).transpose(0,2,1,3) # (B,Tq,C)->(B,h,Tq,H)
-        ga = np.matmul(gy, v.transpose(0,1,3,2))     # (B,h,Tq,H)@(B,h,H,Tv)->(B,h,Tq,Tv) Tv=Tk
-        gv = np.matmul(a.transpose(0,1,3,2), gy)     # (B,h,Tk,Tq)@(B,h,Tq,H)->(B,h,Tk,H) tk=Tv
+        ga = snp.matmul(gy, v.transpose(0,1,3,2))     # (B,h,Tq,H)@(B,h,H,Tv)->(B,h,Tq,Tv) Tv=Tk
+        gv = snp.matmul(a.transpose(0,1,3,2), gy)     # (B,h,Tk,Tq)@(B,h,Tq,H)->(B,h,Tk,H) tk=Tv
 
         ga = self.DO.backward(ga)
 
@@ -4134,9 +4134,9 @@ class AttentionUnit_bkup(Function):
         if self.scale:
             ga *= np.array(H ** -0.5, dtype=ga.dtype)
 
-        gq = np.matmul(ga, k)                      # (B,h,Tq,Tk)@(B,h,Tk,H)->(B,h,Tq,H)
-        #gk = np.matmul(q.transpose(0,1,3,2), ga)  # <-これはNG 20250525AI
-        gk = np.matmul(ga.transpose(0,1,3,2), q)   # (B,h,Tk,Tq)@(B,h,Tq,H)->(B,h,Tk,H)
+        gq = snp.matmul(ga, k)                      # (B,h,Tq,Tk)@(B,h,Tk,H)->(B,h,Tq,H)
+        #gk = snp.matmul(q.transpose(0,1,3,2), ga)  # <-これはNG 20250525AI
+        gk = snp.matmul(ga.transpose(0,1,3,2), q)   # (B,h,Tk,Tq)@(B,h,Tq,H)->(B,h,Tk,H)
         gv = gv.transpose(0,2,1,3).reshape(B,Tv,C) # (B,h,Tv,H)->(B,Tv,C)
         gk = gk.transpose(0,2,1,3).reshape(B,Tk,C) # (B,h,Tk,H)->(B,Tk,C)
         gq = gq.transpose(0,2,1,3).reshape(B,Tq,C) # (B,h,Tq,H)->(B,Tq,C)
@@ -4206,7 +4206,7 @@ class AttentionUnit(Function):
             raise ValueError(
                 f"q_head must be divisible by v_head: q_head={hq}, v_head={hv}")
 
-        a = np.matmul(
+        a = snp.matmul(
             q.reshape(B,hk,hq//hk,Tq,Hq), k.transpose(0,1,3,2)[:,:,None,:,:])
         a = a.reshape(B,hq,Tq,Tk)   # (B,hk,hq//hk,Tq,Tk)->(B,hq,Tq,Tk)
 
@@ -4241,7 +4241,7 @@ class AttentionUnit(Function):
 
         a = self.DO.forward(a, dropout=dropout)
 
-        y = np.matmul(a.reshape(B,hv,hq//hv,Tq,Tk) , v[:,:,None,:,:])
+        y = snp.matmul(a.reshape(B,hv,hq//hv,Tq,Tk) , v[:,:,None,:,:])
         y = y.reshape(B,hq,Tq,Hv)    # (B,hv,hq//hv,Tq,Hv) -> (B,hq,Tq,Hv)
 
         y = y.transpose(0,2,1,3).reshape(B,Tq,hq*Hv) # (B,hq,Tq,Hv)->(B,Tq,hq*Hv)
@@ -4270,13 +4270,15 @@ class AttentionUnit(Function):
 
         gy = gy.reshape(B,Tq,hq,Hv).transpose(0,2,1,3) # (B,Tq,hq*Hv)->(B,hq,Tq,Hv)
 
-        ga = np.matmul(
+        ga = snp.matmul(
             gy.reshape(B,hv,hq//hv,Tq,Hv), v.transpose(0,1,3,2)[:,:,None,:,:])             
         ga = ga.reshape(B,hq,Tq,Tk)   # (B,hv,hq//hv,Tq,Tk) -> (B,hq,Tq,Tk)
         
-        gv = np.matmul(
-            a.reshape(B,hv,hq//hv,Tq,Tk).transpose(0,1,2,4,3), gy.reshape(B,hv,hq//hv,Tq,Hv))
-        gv = np.sum(gv, axis=2)       # goup方向(hq//hv)を加算
+        # グループ方向(hq//hv)の加算を行列積の縮約に含める(1回の積で済む)
+        #   (B,hv,Tk,g*Tq)@(B,hv,g*Tq,Hv) -> (B,hv,Tk,Hv)
+        gv = snp.matmul(
+            a.reshape(B,hv,hq//hv,Tq,Tk).transpose(0,1,4,2,3).reshape(B,hv,Tk,hq//hv*Tq),
+            gy.reshape(B,hv,hq//hv*Tq,Hv))
  
         ga = self.DO.backward(ga)
 
@@ -4292,12 +4294,14 @@ class AttentionUnit(Function):
         if self.scale:
             ga *= np.array(Hk ** -0.5, dtype=ga.dtype)
 
-        gq = np.matmul(ga.reshape(B,hk,hq//hk,Tq,Tk), k[:,:,None,:,:])
+        gq = snp.matmul(ga.reshape(B,hk,hq//hk,Tq,Tk), k[:,:,None,:,:])
         gq = gq.reshape(B,hq,Tq,Hq)   # (B,hk,hq//hk,Tq,Hq) -> (B,hq,Tq,Hq)
 
-        gk = np.matmul(
-            ga.reshape(B,hk,hq//hk,Tq,Tk).transpose(0,1,2,4,3), q.reshape(B,hk,hq//hk,Tq,Hq))
-        gk = np.sum(gk, axis=2)       # goup方向(hq//hk)を加算  
+        # グループ方向(hq//hk)の加算を行列積の縮約に含める
+        #   (B,hk,Tk,g*Tq)@(B,hk,g*Tq,Hq) -> (B,hk,Tk,Hq)
+        gk = snp.matmul(
+            ga.reshape(B,hk,hq//hk,Tq,Tk).transpose(0,1,4,2,3).reshape(B,hk,Tk,hq//hk*Tq),
+            q.reshape(B,hk,hq//hk*Tq,Hq))
 
         if self.rope is not None:
             gq, gk = self.rope.backward(gq, gk)  
@@ -4403,7 +4407,7 @@ class QueryChunkAttentionUnit(AttentionUnit):
         y = np.empty((B,hq,Tq,Hv), dtype=Config.dtype)
         for i in range(0, Tq, chunk_size):
             j = min(i + chunk_size, Tq)
-            a_chunk = np.matmul(q[:,:,:,i:j,:], kt)
+            a_chunk = snp.matmul(q[:,:,:,i:j,:], kt)
             a_chunk = a_chunk.reshape(B,hq,j-i,Tk)
 
             if self.scale:
@@ -4430,7 +4434,7 @@ class QueryChunkAttentionUnit(AttentionUnit):
             a_drop_chunk = self.DO.forward(
                 a_soft_chunk, dropout_mx_chunk, dropout=dropout)
 
-            y_chunk = np.matmul(a_drop_chunk.reshape(B,hv,hq//hv,j-i,Tk), v[:,:,None,:,:])
+            y_chunk = snp.matmul(a_drop_chunk.reshape(B,hv,hq//hv,j-i,Tk), v[:,:,None,:,:])
             y_chunk = y_chunk.reshape(B,hq,j-i,Hv)
 
             y[:,:,i:j,:] = y_chunk
@@ -4485,7 +4489,7 @@ class QueryChunkAttentionUnit(AttentionUnit):
         for i in range(0, Tq, chunk_size):
             j = min(i + chunk_size, Tq)
             # -- 順伝播再計算 --
-            a_chunk = np.matmul(q.reshape(B,hk,hq//hk,Tq,Hq)[:,:,:,i:j,:], kt)
+            a_chunk = snp.matmul(q.reshape(B,hk,hq//hk,Tq,Hq)[:,:,:,i:j,:], kt)
             a_chunk = a_chunk.reshape(B,hq,j-i,Tk)
 
             if self.scale:
@@ -4510,11 +4514,11 @@ class QueryChunkAttentionUnit(AttentionUnit):
 
             # -- 以下、逆伝播の計算 --
             gy_chunk = gy[:,:,i:j,:]
-            ga_chunk = np.matmul(
+            ga_chunk = snp.matmul(
                 gy_chunk.reshape(B,hv,hq//hv,j-i,Hv), v.transpose(0,1,3,2)[:,:,None,:,:])
             ga_chunk = ga_chunk.reshape(B,hq,j-i,Tk)
 
-            gv_chunk = np.matmul(
+            gv_chunk = snp.matmul(
                 a_drop_chunk.reshape(B,hv,hq//hv,j-i,Tk).transpose(0,1,2,4,3),
                 gy_chunk.reshape(B,hv,hq//hv,j-i,Hv))
                                  
@@ -4535,10 +4539,10 @@ class QueryChunkAttentionUnit(AttentionUnit):
             if self.scale:
                 ga_chunk *= invrootH
 
-            gq_chunk = np.matmul(ga_chunk.reshape(B,hk,hq//hk,j-i,Tk), k[:,:,None,:,:])
+            gq_chunk = snp.matmul(ga_chunk.reshape(B,hk,hq//hk,j-i,Tk), k[:,:,None,:,:])
             gq[:,:,i:j,:] = gq_chunk.reshape(B,hq,j-i,Hq)
             
-            gk_chunk = np.matmul(ga_chunk.reshape(B,hk,hq//hk,j-i,Tk).transpose(0,1,2,4,3),
+            gk_chunk = snp.matmul(ga_chunk.reshape(B,hk,hq//hk,j-i,Tk).transpose(0,1,2,4,3),
                                  q.reshape(B,hk,hq//hk,Tq,Hq)[:,:,:,i:j,:])
             gk += np.sum(gk_chunk, axis=2) 
 
@@ -5066,17 +5070,17 @@ class ContextualSelfAttentionZ1(ContextualSelfAttention):
         self.x = x
         # 入力xからkeyを生成 keyの形状 (B, T, H)
         #print('### x =', x.shape, 'w =', self.w.shape)   
-        self.k = np.matmul(x, w) + b      # (B,T,H)
+        self.k = snp.matmul(x, w) + b      # (B,T,H)
         #print('### k =', self.k.shape, 'q =', self.q.shape)   
 
         # s:scoreとa:attention_weightを算出 sとaの形状:(B,T)
-        s = np.matmul(self.q, self.k.transpose(0,2,1)) # (1,1,H)*(B,T,H)->(B,1,T)
+        s = snp.matmul(self.q, self.k.transpose(0,2,1)) # (1,1,H)*(B,T,H)->(B,1,T)
         #print('### s =', s.shape)
         s *= m ** -0.5                              # スケーリング
         self.a = self.softmax.forward(s)
         #print('### a =', self.a.shape)
         # 入力(B, T, H)をバッチ軸(B)はそのままにして、時系列軸(T)方向に重み付け
-        c = np.matmul(self.a, x) # (B,1,T)*(B,T,H)->(B,1,H)
+        c = snp.matmul(self.a, x) # (B,1,T)*(B,T,H)->(B,1,H)
         # コンテキストベクトル y.shape:(B, H) 
         y = c.reshape(B, n)                         # (B,1,H) -> (B,H)
         #print('### y =', y.shape)
@@ -5093,28 +5097,28 @@ class ContextualSelfAttentionZ1(ContextualSelfAttention):
         # 重み付け和の逆伝播
         gc = gy.reshape(B, 1, n) # (B,H)->(B,1,H)
  
-        ga = np.matmul(gc, x.transpose(0,2,1))
-        gx = np.matmul(a.transpose(0,2,1), gc)
+        ga = snp.matmul(gc, x.transpose(0,2,1))
+        gx = snp.matmul(a.transpose(0,2,1), gc)
         #print('### ga =', ga.shape, 'gx =', gx.shape)
         # attention_weightの逆伝播
         gs = self.softmax.backward(ga)
         gs *= m ** -0.5
 
         #print('### gs =', gs.shape, 'q =', self.q.shape)
-        gk = np.matmul(gs.transpose(0,2,1), q)     # (B,1,T)*(1,1,H)->(B,T,H)
+        gk = snp.matmul(gs.transpose(0,2,1), q)     # (B,1,T)*(1,1,H)->(B,T,H)
         #print('### gk =', gk.shape)
         #print('### k =', self.k.shape, 'gs =', gs.shape) 
-        gq = np.matmul(gs, self.k)                      # (B,1,T)*(B,T,H)->(B,1,H)
+        gq = snp.matmul(gs, self.k)                      # (B,1,T)*(B,T,H)->(B,1,H)
         #print('### gq =', gq.shape)
         grad_q = np.sum(gq, axis=0, keepdims=True) # (B,1,H) -> (1,1,H)
         #print('### grad_q =', self.grad_q.shape)
         # keyの逆伝播
-        #self.grad_w = np.matmul(x.reshape(-1, m).T, gk.reshape(-1, n))
-        grad_w = np.matmul(x.transpose(0,2,1), gk)  # (B,H,T) * (B,T,H) -> (B,H,H)
+        #self.grad_w = snp.matmul(x.reshape(-1, m).T, gk.reshape(-1, n))
+        grad_w = snp.matmul(x.transpose(0,2,1), gk)  # (B,H,T) * (B,T,H) -> (B,H,H)
         grad_w = np.sum(grad_w, axis=0)        # (B,H,H) -> (H,H)
         grad_b = np.sum(gk, axis=(0,1))        # (B,T,H) -> (H,)
         #print('### grad_w', self.grad_w.shape)
-        gx += np.matmul(gk, self.w.T)
+        gx += snp.matmul(gk, self.w.T)
         #input()
         self.parameters.set_gradient(grad_w, grad_b, grad_q)
         return gx
@@ -5156,11 +5160,11 @@ class ContextualSelfAttentionZ2(ContextualSelfAttention):
         self.x = x
         # 入力xからkeyを生成 keyの形状 (B, T, H)
         #print('### x =', x.shape, 'w =', self.w.shape)   
-        self.k = np.matmul(x, self.w) + self.b      # (B,T,H)
+        self.k = snp.matmul(x, self.w) + self.b      # (B,T,H)
         #print('### k =', self.k.shape, 'q =', self.q.shape)   
         # s:scoreとa:attention_weightを算出 sとaの形状:(B,T)
         q = self.q.reshape(1,n,1)                   # (H,) -> (1,H,1) 
-        s = np.matmul(self.k, q)                    # (B,T,H) * (1,H,1) -> (B,T,1)
+        s = snp.matmul(self.k, q)                    # (B,T,H) * (1,H,1) -> (B,T,1)
         s = s.reshape(B, T)
         #print('### s =', s.shape)
         s *= n ** -0.5                              # スケーリング
@@ -5191,20 +5195,20 @@ class ContextualSelfAttentionZ2(ContextualSelfAttention):
         gs = gs[..., np.newaxis]
         #print('### gs =', gs.shape, 'q =', self.q.shape)
         qT = self.q.reshape(1,1,n)
-        gk = np.matmul(gs, qT)     # (B,T,1) * (1,1,H) -> (B,T,H)
+        gk = snp.matmul(gs, qT)     # (B,T,1) * (1,1,H) -> (B,T,H)
         #print('### gk =', gk.shape)
         #print('### k =', self.k.shape, 'gs =', gs.shape) 
-        gq = np.matmul(self.k.transpose(0,2,1), gs) # (B,T,H) * (B,T,1) -> (B,H,1)
+        gq = snp.matmul(self.k.transpose(0,2,1), gs) # (B,T,H) * (B,T,1) -> (B,H,1)
         #print('### gq =', gq.shape)
         gq = np.sum(gq, axis=0)                     # (B,H,1) -> (H,1)
         self.grad_q = gq.reshape(n) 
         #print('### grad_q =', self.grad_q.shape)
         # keyの逆伝播
-        grad_w = np.matmul(x.transpose(0,2,1), gk)  # (B,H,T) * (B,T,H) -> (B,H,H)
+        grad_w = snp.matmul(x.transpose(0,2,1), gk)  # (B,H,T) * (B,T,H) -> (B,H,H)
         self.grad_w = np.sum(grad_w, axis=0)        # (B,H,H) -> (H,H)
         self.grad_b = np.sum(gk, axis=(0,1))        # (B,T,H) -> (H,)
         #print('### grad_w', self.grad_w.shape)
-        gx += np.matmul(gk, self.w.T)
+        gx += snp.matmul(gk, self.w.T)
         #input()
         return gx
 
@@ -5248,10 +5252,10 @@ class ContextualSelfAttentionZ4(ContextualSelfAttention):
         self.x = x
         # 入力xからkeyを生成 keyの形状 (B, T, H)
         #print('### x =', x.shape, 'w =', self.w.shape)   
-        self.k = np.matmul(x, self.w) + self.b      # (B,T,H)
+        self.k = snp.matmul(x, self.w) + self.b      # (B,T,H)
         #print('### k =', self.k.shape, 'q =', self.q.shape)   
         # s:scoreとa:attention_weightを算出 sとaの形状:(B,T)
-        s = np.matmul(self.k, self.q)               # (B,T,H) * (H,1) -> (B,T,1)
+        s = snp.matmul(self.k, self.q)               # (B,T,H) * (H,1) -> (B,T,1)
         #print('### s =', s.shape)
         #s *= T ** -0.5                              # スケーリング
         s *= m ** -0.5                              # スケーリング
@@ -5280,20 +5284,20 @@ class ContextualSelfAttentionZ4(ContextualSelfAttention):
         #gs *= T ** -0.5
         gs *= m ** -0.5
         #print('### gs =', gs.shape, 'q =', self.q.shape)
-        gk = np.matmul(gs, self.q.T)                # (B,T) * (1,H) -> (B,T,H)
+        gk = snp.matmul(gs, self.q.T)                # (B,T) * (1,H) -> (B,T,H)
         #print('### gk =', gk.shape)
         #print('### k =', self.k.shape, 'gs =', gs.shape) 
-        gq = np.matmul(self.k.transpose(0,2,1), gs) # (B,H,T) * (B,T,1) -> (B,H,1)
+        gq = snp.matmul(self.k.transpose(0,2,1), gs) # (B,H,T) * (B,T,1) -> (B,H,1)
         #print('### gq =', gq.shape)
         self.grad_q = np.sum(gq, axis=0)            # (B,H,1) -> (H,1)
         #print('### grad_q =', self.grad_q.shape)
         # keyの逆伝播
-        #self.grad_w = np.matmul(x.reshape(-1, m).T, gk.reshape(-1, n))
-        grad_w = np.matmul(x.transpose(0,2,1), gk)  # (B,H,T) * (B,T,H) -> (B,H,H)
+        #self.grad_w = snp.matmul(x.reshape(-1, m).T, gk.reshape(-1, n))
+        grad_w = snp.matmul(x.transpose(0,2,1), gk)  # (B,H,T) * (B,T,H) -> (B,H,H)
         self.grad_w = np.sum(grad_w, axis=0)        # (B,H,H) -> (H,H)
         self.grad_b = np.sum(gk, axis=(0,1))        # (B,T,H) -> (H,)
         #print('### grad_w', self.grad_w.shape)
-        gx += np.matmul(gk, self.w.T)
+        gx += snp.matmul(gk, self.w.T)
         #input()
         return gx
 

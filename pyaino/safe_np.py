@@ -571,3 +571,42 @@ else: # numpy環境
         erf = _numpy_erf
 
 
+
+
+# ------------------------------------------------------------
+# 行列積 (NLCPy対策)
+# ------------------------------------------------------------
+def matmul(a, b):
+    """
+    np.matmulと同じ。ただしNLCPy(SX-Aurora)ではN次元×2次元の積が
+    ホストのnumpyへ回され非常に遅いので、2次元のdotに直して計算する
+    numpy/cupyでは np.matmul をそのまま使う
+    """
+    if np.__name__ != 'nlcpy':
+        return np.matmul(a, b)
+    if b.ndim == 2:                              # (...,m,k)@(k,n): 1回のdotで
+        if a.ndim == 2:
+            return np.dot(a, b)
+        y = np.dot(np.reshape(a, (-1, a.shape[-1])), b)
+        return np.reshape(y, a.shape[:-1] + (b.shape[-1],))
+    if a.ndim < 3 or a.ndim != b.ndim:
+        return np.matmul(a, b)
+    # bがある軸で1(ブロードキャスト)なら、aのその軸を行に畳み込む
+    #   (...,g,m,k)@(...,1,k,n) -> (...,g*m,k)@(...,k,n)
+    if b.shape[-3] == 1 and a.shape[-3] > 1:
+        g, m = a.shape[-3], a.shape[-2]
+        y = matmul(np.reshape(a, a.shape[:-3] + (g * m, a.shape[-1])), b[..., 0, :, :])
+        return np.reshape(y, a.shape[:-3] + (g, m, b.shape[-1]))
+    m, n = a.shape[-2], b.shape[-1]
+    batch = _numpy.broadcast_shapes(a.shape[:-2], b.shape[:-2])
+    if m * n < 4096 and _math.prod(batch) > 4: # 小さい行列が多数ならホスト経由が速い
+        return np.matmul(a, b)
+    # バッチ付きの積はホストのnumpyへ回るので、バッチごとの2次元dotに分ける
+    a3 = np.reshape(np.broadcast_to(a, batch + a.shape[-2:]), (-1, m, a.shape[-1]))
+    b3 = np.reshape(np.broadcast_to(b, batch + b.shape[-2:]), (-1, b.shape[-2], n))
+    y0 = np.dot(a3[0], b3[0])
+    y = np.empty((a3.shape[0], m, n), dtype=y0.dtype)
+    y[0] = y0
+    for i in range(1, a3.shape[0]):
+        y[i] = np.dot(a3[i], b3[i])
+    return np.reshape(y, batch + (m, n))
