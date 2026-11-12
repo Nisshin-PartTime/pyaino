@@ -85,7 +85,7 @@
 
 ### 残る相違・制約
 - 高階微分（`create_graph=True`）には非対応。逆伝播は数値計算として書いている。
-- safetensors の読み込みとトークナイザはホスト側（numpy / 純Python）で行う。CuPy での動作は未検証。
+- safetensors の読み込みとトークナイザはホスト側（numpy / 純Python）で行う。CuPy での動作は未検証。NLCPy（SX-Aurora）では動作を確認済み（`documents/pyaino_SX-Aurora対応_20261112.md`）。
 - `QwenSelfAttention` は `nn.SelfAttention`（q,k,v を一つの線形層で作る）を継承していない。Qwen の q, k, v はバイアスの有無、Qwen3 の q_norm / k_norm、LoRA を個別に掛けることが HF / PEFT と一致させるのに必要なため、別々の線形層で持っている。
 - `cf.save_parameters` / `load_parameters` は呼び出し元の変数名を名前の起点にするので、保存と読込で同じ変数名（例: `model`）を使う必要がある（pyaino 既存の仕様）。
 
