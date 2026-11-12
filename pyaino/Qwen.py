@@ -37,6 +37,8 @@ import time
 import warnings
 import weakref
 
+import numpy # ホスト側の処理(safetensorsの読み書き, 生成の選択)用
+
 from pyaino.Config import *
 from pyaino.nucleus import Function
 from pyaino import Neuron as nn
@@ -45,6 +47,7 @@ from pyaino import Optimizers
 from pyaino import stems_blocks_heads as sbh
 from pyaino import common_function as cf
 from pyaino import safe_np as snp
+from pyaino import ve_kernels
 from pyaino.QwenTokenizer import resolve_model_dir
 
 
@@ -138,6 +141,7 @@ class LinearLayerLoRA(nn.LinearLayer):
         self.lora_scale = 0.0
         self.lora_DO = nn.Dropout()
         self.lora_dropped = False
+        self._wT = None # NLCPyで凍結中に保持する w の連続な転置 (元のw, w.T)
 
     def add_lora(self, r=8, alpha=16, **kwargs):
         """ LoRAを付加(Aは一様乱数 U(-1/√m, 1/√m)、Bは0で初期化) """
@@ -159,6 +163,20 @@ class LinearLayerLoRA(nn.LinearLayer):
         w, b, gamma = self.parameters()
         w += self.lora_scale * np.matmul(self.lora_a.parameters.w, self.lora_b.parameters.w)
         self.lora_a = self.lora_b = None
+        self._wT = None
+
+    def weight_t(self):
+        """
+        wの転置。NLCPyでは右辺が転置した配列の積が遅い(連続な配列の約3倍)ので、
+        凍結中は連続な転置を作って保持する(wが別の配列に置き換わったら作り直す。
+        凍結中のwをその場で書き換えた場合は、merge_loraと同じく self._wT = None とすること)
+        """
+        w = self.parameters.w
+        if not (self.frozen and np.__name__ == 'nlcpy'):
+            return w.T
+        if self._wT is None or self._wT[0] is not w:
+            self._wT = (w, np.ascontiguousarray(w.T))
+        return self._wT[1]
 
     def __forward__(self, x, *, dropout=0.0):
         y = super().__forward__(x)
@@ -177,8 +195,7 @@ class LinearLayerLoRA(nn.LinearLayer):
                 gxd = self.lora_DO.backward(gxd)
 
         if self.frozen: # 入力の勾配だけ(重みの勾配は計算しない)
-            w, b, gamma = self.parameters()
-            grad_x = snp.matmul(grad_y, w.T)
+            grad_x = snp.matmul(grad_y, self.weight_t())
             self.dot_linear.x = self.dot_linear.y = None # 保持していた入出力を解放
         else:
             grad_x = super().__backward__(grad_y)
@@ -375,6 +392,9 @@ class QwenSelfAttention(Function):
         self.attention_cached = nn.AttentionUnit(head=(hq, hk), causality=True)
         self.attention_cached.softmax = ExactSoftmax()
         self.kv = None
+        # NLCPyでは注意(RoPE含む)を融合カーネルで計算する(転置と小さな積の繰り返しを避ける)
+        self.use_kernels = True
+        self.kctx = None
 
     def __forward__(self, x, *, mask=None, dropout=0.0):
         emb_dim, H, (hq, hk) = self.config
@@ -386,10 +406,12 @@ class QwenSelfAttention(Function):
             q = self.q_norm.forward(q.reshape(B, T, hq, H)).reshape(B, T, hq * H)
             k = self.k_norm.forward(k.reshape(B, T, hk, H)).reshape(B, T, hk * H)
 
-        if self.kv is None:
-            y = self.attention.forward(q, k, v, mask=mask)
-        else:
+        if self.kv is not None:
             y = self.forward_cached(q, k, v)
+        elif self.kernels() is not None:
+            y = self.attention_kernels(q, k, v, mask)
+        else:
+            y = self.attention.forward(q, k, v, mask=mask)
 
         y = self.linear_o.forward(y, dropout=dropout)
         return y
@@ -414,11 +436,53 @@ class QwenSelfAttention(Function):
         self.attention_cached.tril = tril.astype(Config.dtype)[None, None]
         return self.attention_cached.forward(q, k, v)
 
+    def kernels(self):
+        if not self.use_kernels:
+            return None
+        return ve_kernels.get_kernels(np, Config.dtype)
+
+    def attention_kernels(self, q, k, v, mask):
+        """ AttentionUnit(GQA, 因果マスク, half型RoPE, 厳密なsoftmax)と同じ計算をVEの融合カーネルで """
+        kern = self.kernels()
+        emb_dim, H, (hq, hk) = self.config
+        B, T, _ = q.shape
+        cos, sin = self.attention.rope.get_cos_sin(np.empty((T, H), dtype=q.dtype))
+        cos = np.ascontiguousarray(cos.reshape(T, -1))
+        sin = np.ascontiguousarray(sin.reshape(T, -1))
+        q, k, v = (np.ascontiguousarray(a) for a in (q, k, v))
+        qr, kr = np.empty_like(q), np.empty_like(k)
+        kern.rope(q, qr, cos, sin, hq)
+        kern.rope(k, kr, cos, sin, hk)
+        if mask is not None:
+            mask = np.ascontiguousarray(np.asarray(mask).reshape(B, T).astype(q.dtype))
+        P = np.empty((B, hq, T, T), dtype=q.dtype)
+        y = np.empty_like(q)
+        kern.attn_fwd(qr, kr, v, mask, P, y, hq, hk)
+        self.kctx = qr, kr, v, P, cos, sin
+        return y
+
+    def attention_kernels_backward(self, gy):
+        kern = self.kernels()
+        emb_dim, H, (hq, hk) = self.config
+        qr, kr, v, P, cos, sin = self.kctx
+        self.kctx = None
+        gy = np.ascontiguousarray(gy)
+        gS = np.empty_like(P)
+        gqr, gkr, gv = np.empty_like(qr), np.empty_like(kr), np.empty_like(v)
+        kern.attn_bwd(gy, qr, kr, v, P, gS, gqr, gkr, gv, hq, hk)
+        gq, gk = np.empty_like(qr), np.empty_like(kr)
+        kern.rope(gqr, gq, cos, sin, hq, inverse=True)
+        kern.rope(gkr, gk, cos, sin, hk, inverse=True)
+        return gq, gk, gv
+
     def __backward__(self, gy):
         emb_dim, H, (hq, hk) = self.config
         B, T, _ = gy.shape
         gy = self.linear_o.backward(gy)
-        gq, gk, gv = self.attention.backward(gy)
+        if self.kctx is not None:
+            gq, gk, gv = self.attention_kernels_backward(gy)
+        else:
+            gq, gk, gv = self.attention.backward(gy)
         if self.q_norm is not None:
             gq = self.q_norm.backward(gq.reshape(B, T, hq, H)).reshape(B, T, hq * H)
             gk = self.k_norm.backward(gk.reshape(B, T, hk, H)).reshape(B, T, hk * H)
@@ -510,14 +574,24 @@ class LinearLayerCrossEntropyTied(Function):
         self.embedding = weakref.ref(embedding) # パラメタの二重登録を避けるため弱参照
         self.tile_size = tile_size
         self.ignore = ignore
+        self._wT = None
 
     def weight(self):
         return self.embedding().parameters.w # (V, D)
 
-    def __forward__(self, x, t=None):
+    def weight_t(self):
+        """ Eの転置(D,V)。LinearLayerLoRA.weight_tと同じく、NLCPyで凍結中は連続な転置を保持 """
         w = self.weight()
+        if not (self.embedding().frozen and np.__name__ == 'nlcpy'):
+            return w.T
+        if self._wT is None or self._wT[0] is not w:
+            self._wT = (w, np.ascontiguousarray(w.T))
+        return self._wT[1]
+
+    def __forward__(self, x, t=None):
+        wT = self.weight_t()
         if t is None:                         # 推論: logitsを返す
-            return snp.matmul(x, w.T)
+            return snp.matmul(x, wT)
         xf = snp.reshape(x, (-1, x.shape[-1]))
         tf = t.reshape(-1)
         N = xf.shape[0]
@@ -527,7 +601,7 @@ class LinearLayerCrossEntropyTied(Function):
         zt = np.zeros(N, dtype=xf.dtype)      # 正解のlogit
         for s in range(0, N, self.tile_size):
             e = min(s + self.tile_size, N)
-            z = np.dot(xf[s:e], w.T)
+            z = np.dot(xf[s:e], wT)
             m = snp.max(z, axis=-1)
             lse[s:e] = m + np.log(snp.sum(np.exp(z - m[:, None]), axis=-1))
             zt[s:e] = z[np.arange(e - s), np.where(valid[s:e], tf[s:e], 0)]
@@ -537,7 +611,7 @@ class LinearLayerCrossEntropyTied(Function):
 
     def __backward__(self, gy=1.0):
         emb = self.embedding()
-        w = self.weight()
+        w, wT = self.weight(), self.weight_t()
         x = self.x
         xf = snp.reshape(x, (-1, x.shape[-1]))
         tf, valid = self.tf, self.valid
@@ -547,7 +621,7 @@ class LinearLayerCrossEntropyTied(Function):
         gw = None if emb.frozen else np.zeros_like(w)
         for s in range(0, N, self.tile_size):
             e = min(s + self.tile_size, N)
-            z = np.dot(xf[s:e], w.T)
+            z = np.dot(xf[s:e], wT)
             p = np.exp(z - self.lse[s:e, None])               # softmax
             p[np.arange(e - s), np.where(valid[s:e], tf[s:e], 0)] -= 1.0
             p *= (valid[s:e] * gscale)[:, None].astype(p.dtype)
@@ -573,6 +647,224 @@ class LmHeadQwen(sbh.LmHead):
         self.ln_f = RMSNormalizationGamma(eps=eps, **kwargs)
         self.linear_layer = LinearLayerCrossEntropyTied(embedding, tile_size, ignore)
         self.unify = True
+
+
+#### 推論専用の順伝播(生成用) ########################################
+class QwenInference:
+    """
+    生成のための推論専用の順伝播。計算グラフ(Functionの入出力の記録など)を作らず、
+    モデルの重みを直接使って、学習時の順伝播と同じ式を計算する
+    (RMS正規化、q,k,v(+バイアス, Qwen3はq_norm/k_norm)、half型RoPE、GQA、厳密なsoftmax、
+     SwiGLU、LoRAは併合せずに x@A@B*scale を加える)
+    KVキャッシュは層ごとに頭単位 (B,hk,容量,H) で持つ
+    NLCPyでは q|k|v と gate|up の重みを結合して積の回数を減らし(生成のたびに作り直す)、
+    小さな演算はVEの融合カーネル(ve_kernels)にまとめる
+    """
+    def __init__(self, model, fuse=None, kernels=None):
+        self.model = model
+        self.kern = None
+        if kernels is None or kernels:
+            self.kern = ve_kernels.get_kernels(np, Config.dtype)
+            if kernels and self.kern is None:
+                raise RuntimeError('VE kernels are not available.')
+        self.fuse = (np.__name__ == 'nlcpy') if fuse is None else fuse
+        self.fuse = self.fuse or self.kern is not None
+        c = model.config
+        self.eps = c['eps']
+        self.layers = []
+        for blk in model.blocks.layers:
+            sa, ff = blk.sa, blk.ffwd
+            emb_dim, H, (hq, hk) = sa.config
+            L = dict(sa=sa, ff=ff, ln1=blk.ln1.gamma, ln2=blk.ln2.gamma,
+                     H=H, hq=hq, hk=hk, k=None, v=None)
+            if self.fuse:
+                lq, lk, lv = sa.linear_q, sa.linear_k, sa.linear_v
+                L['w_qkv'] = np.concatenate(
+                    [lq.parameters.w, lk.parameters.w, lv.parameters.w], axis=1)
+                L['b_qkv'] = np.concatenate(
+                    [lq.parameters.b, lk.parameters.b, lv.parameters.b]) \
+                    if lq.parameters.bias else None
+                L['w_gu'] = np.concatenate(
+                    [ff.linear_g.parameters.w, ff.linear_i.parameters.w], axis=1)
+            self.layers.append(L)
+        self.length = 0
+
+    def rms(self, x, gamma):
+        sigma = np.sqrt(snp.mean(x * x, axis=-1, keepdims=True) + self.eps)
+        return x / sigma * gamma
+
+    @staticmethod
+    def lora(layer, x, y):
+        """ y に LoRA の寄与を加える """
+        if layer.lora_a is not None:
+            u = snp.matmul(x, layer.lora_a.parameters.w)
+            y += snp.matmul(u, layer.lora_b.parameters.w) * layer.lora_scale
+        return y
+
+    @classmethod
+    def linear(cls, layer, x):
+        p = layer.parameters
+        y = snp.matmul(x, p.w)
+        if p.bias:
+            y += p.b
+        return cls.lora(layer, x, y)
+
+    def rope(self, sa, x, offset):
+        """ x:(B,h,T,H) に位置 offset からの half型RoPEを掛ける(RotaryTransformHalfと同じ式) """
+        rope = sa.attention.rope
+        rope.offset = offset
+        cos, sin = rope.get_cos_sin(x)
+        rope.offset = 0
+        d = x.shape[-1] // 2
+        x0, x1 = x[..., :d], x[..., d:]
+        return np.concatenate([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
+
+    def append_kv(self, L, k, v):
+        B, hk, T, H = k.shape
+        n = self.length
+        if L['k'] is None or L['k'].shape[2] < n + T:
+            cap = max(256, 2 * (n + T))
+            nk = np.empty((B, hk, cap, H), dtype=k.dtype)
+            nv = np.empty((B, hk, cap, H), dtype=v.dtype)
+            if L['k'] is not None:
+                nk[:, :, :n] = L['k'][:, :, :n]
+                nv[:, :, :n] = L['v'][:, :, :n]
+            L['k'], L['v'] = nk, nv
+        L['k'][:, :, n:n + T] = k
+        L['v'][:, :, n:n + T] = v
+        return L['k'][:, :, :n + T], L['v'][:, :, :n + T]
+
+    def attention(self, L, x):
+        sa, H, hq, hk = L['sa'], L['H'], L['hq'], L['hk']
+        B, T, _ = x.shape
+        if self.fuse:
+            qkv = snp.matmul(x, L['w_qkv'])
+            if L['b_qkv'] is not None:
+                qkv += L['b_qkv']
+            q = qkv[..., :hq * H]
+            k = qkv[..., hq * H:(hq + hk) * H]
+            v = qkv[..., (hq + hk) * H:]
+            q = self.lora(sa.linear_q, x, q)
+            k = self.lora(sa.linear_k, x, k)
+            v = self.lora(sa.linear_v, x, v)
+        else:
+            q = self.linear(sa.linear_q, x)
+            k = self.linear(sa.linear_k, x)
+            v = self.linear(sa.linear_v, x)
+        q = q.reshape(B, T, hq, H)
+        k = k.reshape(B, T, hk, H)
+        if sa.q_norm is not None:                       # Qwen3: 頭ごとに正規化
+            q = self.rms(q, sa.q_norm.gamma)
+            k = self.rms(k, sa.k_norm.gamma)
+        q = self.rope(sa, q.transpose(0, 2, 1, 3), self.length)   # (B,hq,T,H)
+        k = self.rope(sa, k.transpose(0, 2, 1, 3), self.length)   # (B,hk,T,H)
+        v = v.reshape(B, T, hk, H).transpose(0, 2, 1, 3)
+        k, v = self.append_kv(L, k, v)                  # (B,hk,Tk,H)
+        Tk = k.shape[2]
+        g = hq // hk                                    # GQA: q頭 h は kv頭 h//g を使う
+        q = np.reshape(q, (B, hk, g * T, H))
+        a = snp.matmul(q, k.transpose(0, 1, 3, 2)) * (H ** -0.5)    # (B,hk,g*T,Tk)
+        if T > 1:                                       # 位置 offset+i は j<=offset+i を見る
+            a = a.reshape(B, hk, g, T, Tk)
+            allow = np.arange(Tk)[None, :] <= (np.arange(T)[:, None] + self.length)
+            a = np.where(allow, a, -np.inf)
+            a = a.reshape(B, hk, g * T, Tk)
+        a = np.exp(a - snp.max(a, axis=-1, keepdims=True))
+        a /= snp.sum(a, axis=-1, keepdims=True)
+        y = snp.matmul(a, v)                            # (B,hk,g*T,H)
+        y = y.reshape(B, hq, T, H).transpose(0, 2, 1, 3).reshape(B, T, hq * H)
+        return self.linear(sa.linear_o, y)
+
+    def mlp(self, L, x):
+        ff = L['ff']
+        if self.fuse:
+            gu = snp.matmul(x, L['w_gu'])
+            n = gu.shape[-1] // 2
+            gate = self.lora(ff.linear_g, x, gu[..., :n])
+            up = self.lora(ff.linear_i, x, gu[..., n:])
+        else:
+            gate = self.linear(ff.linear_g, x)
+            up = self.linear(ff.linear_i, x)
+        with _no_overflow_warning():
+            gate = gate * (1.0 / (1.0 + np.exp(-gate)))  # SiLU(A.Swishと同じ)
+        return self.linear(ff.linear_o, gate * up)
+
+    def forward(self, idx):
+        """ idx:(B,T) を位置 self.length から順伝播し、最後の位置のlogits (B,V) を返す """
+        if self.kern is not None:
+            return self.forward_kernels(idx)
+        model = self.model
+        x = model.embed.parameters.w[idx]
+        for L in self.layers:
+            x = x + self.attention(L, self.rms(x, L['ln1']))
+            x = x + self.mlp(L, self.rms(x, L['ln2']))
+        self.length += idx.shape[1]
+        h = self.rms(x[:, -1], model.lm_head.ln_f.gamma)  # (B,D)
+        return self.logits(h)
+
+    def logits(self, h):
+        w = self.model.lm_head.linear_layer.weight()      # (V,D)
+        if h.shape[0] == 1:
+            return np.dot(w, h[0])[None]                 # 行列ベクトル積の方が速い
+        return np.dot(h, w.T)
+
+    def kv_buffers(self, L, B, hk, H, n):
+        """ 融合カーネル用に、長さnまで入る転置したKVキャッシュ(B,hk,H,容量)を用意する """
+        if L['k'] is None or L['k'].shape[3] < n:
+            cap = max(256, 2 * n)
+            nk = np.empty((B, hk, H, cap), dtype=Config.dtype)
+            nv = np.empty((B, hk, H, cap), dtype=Config.dtype)
+            if L['k'] is not None:
+                nk[..., :self.length] = L['k'][..., :self.length]
+                nv[..., :self.length] = L['v'][..., :self.length]
+            L['k'], L['v'] = nk, nv
+        return L['k'], L['v']
+
+    def forward_kernels(self, idx):
+        """ forwardと同じ計算を、小さな演算をVEの融合カーネルにまとめて行う """
+        kern, model, eps = self.kern, self.model, self.eps
+        B, T = idx.shape
+        n, offset = B * T, self.length
+        x = np.ascontiguousarray(model.embed.parameters.w[idx.reshape(-1)])  # (n,D)
+        h = np.empty_like(x)
+        d = None                                         # 前の層の出力(残差に加える)
+        rope = self.layers[0]['sa'].attention.rope
+        H0 = self.layers[0]['H']
+        rope.offset = offset                             # RoPEの表は全層で共通
+        cos, sin = rope.get_cos_sin(np.empty((T, H0), dtype=Config.dtype))
+        rope.offset = 0
+        cos = np.ascontiguousarray(cos.reshape(T, -1))
+        sin = np.ascontiguousarray(sin.reshape(T, -1))
+        for L in self.layers:
+            sa, ff, H, hq, hk = L['sa'], L['ff'], L['H'], L['hq'], L['hk']
+            kern.add_rms(x, d, L['ln1'], h, eps)         # x += d; h = rms(x)
+            qkv = np.dot(h, L['w_qkv'])
+            self.lora(sa.linear_q, h, qkv[:, :hq * H])
+            self.lora(sa.linear_k, h, qkv[:, hq * H:(hq + hk) * H])
+            self.lora(sa.linear_v, h, qkv[:, (hq + hk) * H:])
+            kc, vc = self.kv_buffers(L, B, hk, H, offset + T)
+            q = np.empty((B, hq, T, H), dtype=x.dtype)
+            kern.qkv_rope(qkv, L['b_qkv'],
+                          None if sa.q_norm is None else sa.q_norm.gamma,
+                          None if sa.k_norm is None else sa.k_norm.gamma,
+                          cos, sin, q, kc, vc, B, T, hq, hk, H, offset, eps)
+            y = np.empty((n, hq * H), dtype=x.dtype)
+            kern.attention(q, kc, vc, y, B, T, hq, hk, H, offset)
+            d = self.linear(sa.linear_o, y)
+            kern.add_rms(x, d, L['ln2'], h, eps)
+            gu = np.dot(h, L['w_gu'])
+            I = gu.shape[1] // 2
+            self.lora(ff.linear_g, h, gu[:, :I])
+            self.lora(ff.linear_i, h, gu[:, I:])
+            a = np.empty((n, I), dtype=x.dtype)
+            kern.silu_mul(gu, a)
+            d = self.linear(ff.linear_o, a)
+        self.length += T
+        last = np.ascontiguousarray(x.reshape(B, T, -1)[:, -1])
+        dl = np.ascontiguousarray(d.reshape(B, T, -1)[:, -1])
+        hl = np.empty_like(last)
+        kern.add_rms(last, dl, model.lm_head.ln_f.gamma, hl, eps)
+        return self.logits(hl)
 
 
 #### 言語モデル ######################################################
@@ -764,12 +1056,12 @@ class QwenLanguageModel:
         self.embed.backward(gx)
 
     def grad_norm(self):
-        s = 0.0
+        s = 0.0                  # デバイス上で足し込み、最後に一度だけ取り出す
         for l in self.layers():
             for p, g in l.gradients():
                 if g is not None:
-                    s += float(snp.sum(g.astype('float64') ** 2))
-        return math.sqrt(s)
+                    s = s + snp.sum(g.astype('float64') ** 2)
+        return math.sqrt(float(s))
 
     def update(self, eta=0.001, max_grad_norm=None, **kwargs):
         """
@@ -864,9 +1156,34 @@ class QwenLanguageModel:
                        'fan_in_fan_out': False, 'inference_mode': True}, f, indent=2)
 
     # ---- 生成 ----
+    @staticmethod
+    def _sample(z, beta, top_k, top_p):
+        """
+        z(ホストのnumpy配列)から確率 softmax(z)**beta に従って選ぶ(top_k, top_pで候補を絞る)
+        選択は、numpyでは cf.select_category、cupy/NLCPyでは Config.np の一様乱数による
+        逆関数法(np.random.choice と同じ方法。デバイスとの往復を避ける)。どちらも
+        np.random.seed で再現できる
+        """
+        z = z * beta             # softmax(z)**beta に相当
+        if top_k and top_k > 0:
+            kth = numpy.partition(z, -top_k)[-top_k]
+            z = numpy.where(z < kth, -numpy.inf, z)
+        probs = numpy.exp(z - z.max())
+        probs /= probs.sum()
+        if top_p < 1.0:
+            order = numpy.argsort(-probs)
+            cum = numpy.cumsum(probs[order])
+            probs[order[cum - probs[order] > top_p]] = 0.0
+            probs /= probs.sum()
+        if np is numpy:
+            return int(cf.select_category(probs, True, 1)[0])
+        cdf = numpy.cumsum(probs)
+        u = float(np.random.random_sample()) * cdf[-1]
+        return min(int(numpy.searchsorted(cdf, u, side='right')), len(cdf) - 1)
+
     def generate(self, seed, max_tokens=1000, stochastic=False, beta=2,
                  skip_ids=None, end_ids=None, top_k=0, top_p=1.0,
-                 repetition_penalty=1.0, stream=None):
+                 repetition_penalty=1.0, stream=None, fast=True):
         """
         入力されたidx列(seed)に続くidx列を生成し、seedと結合して返す
         (BigramLanguageModel, RnnLanguageModel と同じく max_tokens はseedを含む全長、
@@ -878,6 +1195,8 @@ class QwenLanguageModel:
         skip_ids        : 選択候補から除外するidx
         stream(idx)     : 1トークンごとに呼ばれる(逐次表示用)
         KVキャッシュを使い、seedは一度だけ、以後は1トークンずつ順伝播する
+        fast=True       : 計算グラフを作らない推論専用の順伝播(QwenInference)を使う
+                          (Falseなら学習と同じ層のforwardをKVCache付きで使う)
         """
         if not isinstance(seed, np.ndarray):
             seed = np.array(seed)
@@ -891,38 +1210,37 @@ class QwenLanguageModel:
         end_ids = set(int(i) for i in (end_ids or []))
         gen_data = [int(i) for i in seed.tolist()]
 
-        for blk in self.blocks.layers:
-            blk.sa.kv = KVCache()
+        if fast:
+            infer = QwenInference(self)
+            step = lambda idx: infer.forward(idx)                     # (1,V)
+        else:
+            for blk in self.blocks.layers:
+                blk.sa.kv = KVCache()
+            step = lambda idx: self.forward(idx, last_only=True)[:, -1] # (1,V)
         try:
-            logits = self.forward(seed.reshape(1, -1), last_only=True)
+            logits = step(seed.reshape(1, -1))
             for i in range(max_tokens - len(seed)):
-                z = logits[0, -1].astype('float64')
+                z = logits[0]
+                if stochastic or repetition_penalty != 1.0 or skip_ids is not None:
+                    # 選択の前処理はホストで行う(cupy/NLCPyでは小さな演算の繰り返しが遅い)
+                    z = (z.get() if hasattr(z, 'get') else numpy.asarray(z)).astype('float64')
                 if repetition_penalty != 1.0:
-                    prev = np.array(sorted(set(gen_data)))
+                    prev = numpy.array(sorted(set(gen_data)))
                     zp = z[prev]
-                    z[prev] = np.where(zp > 0, zp / repetition_penalty,
-                                       zp * repetition_penalty)
+                    z[prev] = numpy.where(zp > 0, zp / repetition_penalty,
+                                          zp * repetition_penalty)
                 if skip_ids is not None: # skip_idsの指すものを選択候補から除外
-                    z[np.array(skip_ids)] = -np.inf
+                    z[numpy.array(skip_ids)] = -numpy.inf
                 if stochastic:
-                    z = z * beta         # softmax(z)**beta に相当
-                    if top_k and top_k > 0:
-                        kth = np.partition(z, -top_k)[-top_k]
-                        z = np.where(z < kth, -np.inf, z)
-                probs = np.exp(z - z.max())
-                probs /= probs.sum()
-                if stochastic and top_p < 1.0:
-                    order = np.argsort(-probs)
-                    cum = np.cumsum(probs[order])
-                    probs[order[cum - probs[order] > top_p]] = 0.0
-                    probs /= probs.sum()
-                next_idx = int(cf.select_category(probs, stochastic, 1)[0])
+                    next_idx = self._sample(z, beta, top_k, top_p)
+                else:                    # 確定的: softmaxを経ずにargmax(結果は同じ)
+                    next_idx = int(z.argmax())
                 gen_data.append(next_idx)
                 if stream is not None:
                     stream(next_idx)
                 if next_idx in end_ids: # end_idが出現したら打切り
                     break
-                logits = self.forward(np.array([[next_idx]]))
+                logits = step(np.array([[next_idx]]))
         finally:
             for blk in self.blocks.layers:
                 blk.sa.kv = None

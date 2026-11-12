@@ -12,8 +12,8 @@
 | `test_Qwen_peft_export.py` | `export_peft` で書き出したアダプタを transformers+peft で読み込み、logits を比較 | 相対誤差 1.1e-5、argmax 100% 一致 |
 
 ## 速度（Qwen2.5-0.5B, fp32）
-- CPU（16スレッド。40スレッドでは逆に遅い）: 生成 約4.5〜6.5 tok/s、LoRA学習1ステップ（約840〜980トークン）約17〜18秒、全パラメタ 約30秒（メモリ約10GB）
-- SX-Aurora VE 1枚（NLCPy）: 生成 約8 tok/s、LoRA学習1ステップ（976トークン）約3.9秒
+- CPU（16スレッド。40スレッドでは逆に遅い）: 生成 約6 tok/s（推論専用の順伝播 `QwenInference`）、LoRA学習1ステップ（約840〜980トークン）約17〜18秒、全パラメタ 約30秒（メモリ約10GB）
+- SX-Aurora VE 1枚（NLCPy）: 生成 約70 tok/s（VEの融合カーネル）、LoRA学習1ステップ（976トークン）約1.8秒、下の LoRA 実験の学習は62秒（CPUは約7分）
   - 実行方法は `documents/pyaino_SX-Aurora対応_20261112.md`。`bash tools/sx_aurora/run_ve.sh <venv> experiments/qwen/run_experiment.py --mode lora` のように動かす
 
 ## 実験：pyaino の知識を教える（`run_experiment.py`）

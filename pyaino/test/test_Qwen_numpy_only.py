@@ -2,6 +2,8 @@
 #   小さな乱数初期化のQwen2/Qwen3構成で
 #   1) 解析的勾配 vs 有限差分 (全パラメタ, LoRA)
 #   2) KVキャッシュ有り逐次計算 == キャッシュ無し一括計算
+#      生成用の推論専用順伝播(QwenInference, 重み結合の有無, VEの融合カーネル)も同じ値か
+#      (NLCPyのみ)学習用の融合カーネルの注意がAttentionUnitと同じ損失・勾配か(padding maskあり)
 #   3) LoRA保存→読込, merge の一致
 #   4) cf.save_parameters / cf.load_parameters による全パラメタの保存・復元
 # 乱数の重み・入力はsafetensorsと同じくホスト側のnumpyで作るので、
@@ -80,6 +82,27 @@ for mt in ('qwen2', 'qwen3'):
     for blk in model.blocks.layers:
         blk.sa.kv = None
     e_cache = float(np.abs(np.concatenate([z1, z2, z3], axis=1) - z_full).max())
+    from pyaino.Qwen import QwenInference
+    e_infer = 0.0
+    for fuse, kernels in ((False, False), (True, False), (True, None)): # None: NLCPyなら融合カーネル
+        inf = QwenInference(model, fuse=fuse, kernels=kernels)
+        zs = [inf.forward(x[:, :4]), inf.forward(x[:, 4:6]), inf.forward(x[:, 6:7])]
+        for T, z in zip((4, 6, 7), zs):
+            e_infer = max(e_infer, float(np.abs(z - z_full[:, T - 1]).max()))
+
+    # 2') NLCPyの融合カーネルによる注意(学習用) == AttentionUnit (padding maskあり)
+    e_kern = 0.0
+    from pyaino import ve_kernels
+    if ve_kernels.get_kernels(np, Config.dtype) is not None:
+        mask = np.ones(x.shape); mask[1, -2:] = 0
+        res = []
+        for use in (True, False):
+            for blk in model.blocks.layers:
+                blk.sa.use_kernels = use
+            loss = float(model.forward(x, t, mask=mask)); model.backward()
+            res.append((loss, {k: v.copy() for k, v in model.lora_parameters(grad=True).items()}))
+        (l1, g1), (l2, g2) = res
+        e_kern = abs(l1 - l2) + max(float(np.abs(g1[k] - g2[k]).max()) for k in g1)
 
     with tempfile.TemporaryDirectory() as td:
         # 3) LoRA保存・読込・併合
@@ -99,8 +122,8 @@ for mt in ('qwen2', 'qwen3'):
         cf.load_parameters(os.path.join(td, 'all.pkl'), m)
         e_pkl = float(np.abs(m.forward(x) - z_full).max())
 
-    print(f'{mt}: grad(full) {e_full:.1e}  grad(LoRA) {e_lora:.1e}  cache {e_cache:.1e}  '
+    print(f'{mt}: grad(full) {e_full:.1e}  grad(LoRA) {e_lora:.1e}  cache {e_cache:.1e}  infer {e_infer:.1e}  VE-kernel {e_kern:.1e}  '
           f'lora-reload {e_load:.1e}  merge {e_merge:.1e}  save/load_parameters {e_pkl:.1e}')
     assert e_full < 1e-6 and e_lora < 1e-6, 'gradient check failed'
-    assert e_cache < 1e-12 and e_load < 1e-12 and e_merge < 1e-10 and e_pkl < 1e-10
+    assert e_cache < 1e-12 and e_infer < 1e-12 and e_kern < 1e-12 and e_load < 1e-12 and e_merge < 1e-10 and e_pkl < 1e-10
 print('ALL OK')

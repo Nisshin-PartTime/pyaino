@@ -66,6 +66,7 @@
 | `LmHeadQwen` | `sbh.LmHead` | `unify=True`（損失まで一体処理）の構成として `forward` / `backward` / `update` を**そのまま使用** |
 | `LinearLayerCrossEntropyTied` | `Function` | 重み共有の出力層＋タイル分割の交差エントロピー（ignore対応） |
 | `QwenLanguageModel` | `BigramLanguageModel` に倣う | `embed`, `blocks`（`nn.Sequential`）, `lm_head` と `forward(idx, targets, mask, dropout)` / `backward()` / `update(eta, **kwargs)` / `generate(seed, max_tokens, stochastic, beta, skip_ids, end_ids)`（seedを含む全長を指定し、seedと結合した配列を返す。選択は `cf.select_category`） |
+| `QwenInference` | （pyaino の部品を使わない） | 生成専用の順伝播。計算グラフを作らず各層の重みを直接使い、学習時と同じ式を計算する（数値の一致はテストで確認）。NLCPy では VE の融合カーネル（`ve_kernels.py`）を使う |
 | `QwenTokenizer` | `cf.Tokenizer` に倣う | `encode`（既定で `np.array`）/ `decode` / `vocab_size()` / `token2id` / `id2token` / `split_text_into_tokens` |
 
 ### pyaino の流儀に合わせた点
@@ -80,7 +81,7 @@
 ### pyaino にない機能として追加したもの（本体ではなく Qwen.py 内）
 - `frozen`（凍結）、LoRA（`apply_lora`, `merge_lora`, `save_lora` / `load_lora`（pickle 辞書）, `export_peft`）
 - 全体の勾配ノルムでのクリップ（`update(eta, max_grad_norm=...)`）
-- KVキャッシュ（`KVCache`）と、`generate` の top-k / top-p / repetition penalty
+- KVキャッシュ（`KVCache`）と、`generate` の top-k / top-p / repetition penalty、生成専用の順伝播（`QwenInference`）
 - safetensors の読み書き、HF 名との対応表（`parameter_table`, `hf_state_dict`）
 
 ### 残る相違・制約
