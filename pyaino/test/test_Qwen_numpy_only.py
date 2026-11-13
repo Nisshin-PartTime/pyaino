@@ -3,7 +3,8 @@
 #   1) 解析的勾配 vs 有限差分 (全パラメタ, LoRA)
 #   2) KVキャッシュ有り逐次計算 == キャッシュ無し一括計算
 #      生成用の推論専用順伝播(QwenInference, 重み結合の有無, VEの融合カーネル)も同じ値か
-#      (NLCPyのみ)学習用の融合カーネルの注意がAttentionUnitと同じ損失・勾配か(padding maskあり)
+#      (NLCPyのみ)学習用の融合カーネル(注意、出力層+交差エントロピー)が
+#      AttentionUnit・タイル計算と同じ損失・勾配か(padding mask, ignoreあり)
 #   3) LoRA保存→読込, merge の一致
 #   4) cf.save_parameters / cf.load_parameters による全パラメタの保存・復元
 # 乱数の重み・入力はsafetensorsと同じくホスト側のnumpyで作るので、
@@ -90,7 +91,7 @@ for mt in ('qwen2', 'qwen3'):
         for T, z in zip((4, 6, 7), zs):
             e_infer = max(e_infer, float(np.abs(z - z_full[:, T - 1]).max()))
 
-    # 2') NLCPyの融合カーネルによる注意(学習用) == AttentionUnit (padding maskあり)
+    # 2') NLCPyの融合カーネル(学習用の注意, 出力層+交差エントロピー) == 従来の計算 (padding maskあり)
     e_kern = 0.0
     from pyaino import ve_kernels
     if ve_kernels.get_kernels(np, Config.dtype) is not None:
@@ -99,6 +100,7 @@ for mt in ('qwen2', 'qwen3'):
         for use in (True, False):
             for blk in model.blocks.layers:
                 blk.sa.use_kernels = use
+            model.lm_head.linear_layer.use_kernels = use
             loss = float(model.forward(x, t, mask=mask)); model.backward()
             res.append((loss, {k: v.copy() for k, v in model.lora_parameters(grad=True).items()}))
         (l1, g1), (l2, g2) = res

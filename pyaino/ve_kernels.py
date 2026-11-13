@@ -11,6 +11,9 @@ _C_SOURCE = r'''
 #include <stdint.h>
 #include <math.h>
 #include <cblas.h>
+#include <omp.h>
+
+void nthreads_SFX(uint64_t p) { *(int64_t*)p = omp_get_max_threads(); }
 
 /* x += d (dが0でなければ); y = x / sqrt(mean(x^2) + eps) * g  (n行 × D列) */
 void add_rms_SFX(uint64_t px, uint64_t pd, uint64_t pg, uint64_t py,
@@ -233,6 +236,55 @@ void silu_mul_SFX(uint64_t pgu, uint64_t py, int64_t n, int64_t I)
             yi[j] = gi[j] * ((REAL)1 / ((REAL)1 + EXP(-gi[j]))) * ui[j];
     }
 }
+
+/* 重み共有の出力層と交差エントロピー。x:(N,D), E:(V,D), ET:(D,V)(Eの連続な転置), t:(N) int64
+   loss[i] = logsumexp(z_i) - z_i[t_i] (z = x·E^T, t_i == ignore の行は0)
+   gx が0でなければ gx = (softmax(z) - onehot(t))·E * gscale (ignoreの行は0) も計算する
+   nth*R 行ずつ: 各スレッドが R 行の z を BLAS で求めて Z:(nth*R, V) に置き、softmax に書き換える。
+   そろったら行を分担して gx を計算する(語彙方向の logits 全体は持たない) */
+void lm_ce_SFX(uint64_t px, uint64_t pw, uint64_t pwt, uint64_t pt, uint64_t pl, uint64_t pgx,
+               uint64_t pZ, int64_t N, int64_t D, int64_t V, int64_t R, int64_t ignore, double gscale)
+{
+    const REAL *x = (const REAL*)px, *w = (const REAL*)pw, *wT = (const REAL*)pwt;
+    const int64_t *t = (const int64_t*)pt;
+    REAL *loss = (REAL*)pl, *gx = (REAL*)pgx, *Z = (REAL*)pZ;
+#pragma omp parallel
+    {
+        const int64_t tid = omp_get_thread_num(), nth = omp_get_num_threads(), BR = nth * R;
+        for (int64_t s0 = 0; s0 < N; s0 += BR) {
+            const int64_t s = s0 + tid * R;
+            const int64_t m = s >= N ? 0 : (N - s < R ? N - s : R);
+            REAL *Zt = Z + tid * R * V;
+            if (m > 0)
+                GEMM(CblasRowMajor, CblasNoTrans, CblasNoTrans, m, V, D,
+                     (REAL)1, x + s * D, D, wT, V, (REAL)0, Zt, V);
+            for (int64_t i = 0; i < m; i++) {
+                REAL *z = Zt + i * V, mx = -INFINITY;
+                for (int64_t j = 0; j < V; j++) if (z[j] > mx) mx = z[j];
+                const int64_t ti = t[s + i];
+                const int valid = ti != ignore;
+                const REAL zt = valid ? z[ti] : 0;
+                double sum = 0.0;
+                for (int64_t j = 0; j < V; j++) { z[j] = EXP(z[j] - mx); sum += z[j]; }
+                loss[s + i] = valid ? mx + (REAL)log(sum) - zt : 0;
+                if (gx) {
+                    const REAL c = valid ? (REAL)(gscale / sum) : 0;
+                    for (int64_t j = 0; j < V; j++) z[j] *= c;
+                    if (valid) z[ti] -= (REAL)gscale;
+                }
+            }
+            if (!gx) continue;
+#pragma omp barrier
+            const int64_t mb = N - s0 < BR ? N - s0 : BR;
+            const int64_t rc = (mb + nth - 1) / nth, r0 = tid * rc;
+            const int64_t rn = r0 >= mb ? 0 : (mb - r0 < rc ? mb - r0 : rc);
+            if (rn > 0)
+                GEMM(CblasRowMajor, CblasNoTrans, CblasNoTrans, rn, D, V,
+                     (REAL)1, Z + r0 * V, V, w, D, (REAL)0, gx + (s0 + r0) * D, D);
+#pragma omp barrier
+        }
+    }
+}
 '''
 
 def _nlc_dir():
@@ -274,8 +326,13 @@ class VEKernels:
             silu_mul=get('silu_mul', (u, u, i, i)),
             rope=get('rope', (u,) * 4 + (i,) * 5),
             attn_fwd=get('attn_fwd', (u,) * 6 + (i,) * 5 + (f,)),
-            attn_bwd=get('attn_bwd', (u,) * 9 + (i,) * 5 + (f,)))
+            attn_bwd=get('attn_bwd', (u,) * 9 + (i,) * 5 + (f,)),
+            lm_ce=get('lm_ce', (u,) * 7 + (i,) * 5 + (f,)))
         self.dtype = dtype
+        buf = np.zeros(1, dtype='int64')
+        get('nthreads', (u,))(buf.ve_adr)
+        self.nthreads = int(buf.get()[0])   # VEのOpenMPのスレッド数(lm_ceの作業領域の大きさに使う)
+        _libs[dtype]['np'] = np
 
     def _f(self, name):
         return _libs[self.dtype][name]
@@ -318,6 +375,21 @@ class VEKernels:
         H = C // hq
         self._f('attn_bwd')(gy.ve_adr, q.ve_adr, k.ve_adr, v.ve_adr, P.ve_adr, gS.ve_adr,
                             gq.ve_adr, gk.ve_adr, gv.ve_adr, B, T, hq, hk, H, float(H ** -0.5))
+
+    # ---- 学習用: 重み共有の出力層 + 交差エントロピー ----
+    def lm_ce(self, x, w, wT, t, ignore, gscale, want_gx=True, R=32):
+        """ x:(N,D), w:(V,D), wT:(D,V), t:(N) int64。行ごとの損失(N)と、want_gxなら gx:(N,D) を返す """
+        L = _libs[self.dtype]
+        np = L['np']
+        N, D = x.shape
+        V = w.shape[0]
+        if L.get('Z') is None or L['Z'].shape != (self.nthreads * R, V):
+            L['Z'] = np.empty((self.nthreads * R, V), dtype=x.dtype)   # 作業領域(使い回す)
+        loss = np.empty(N, dtype=x.dtype)
+        gx = np.empty((N, D), dtype=x.dtype) if want_gx else None
+        self._f('lm_ce')(x.ve_adr, w.ve_adr, wT.ve_adr, t.ve_adr, loss.ve_adr, self._adr(gx),
+                         L['Z'].ve_adr, N, D, V, R, int(ignore), float(gscale))
+        return loss, gx
 
 
 def get_kernels(np, dtype):

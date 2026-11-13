@@ -568,13 +568,17 @@ class LinearLayerCrossEntropyTied(Function):
     行方向のタイルで計算する(語彙15万でもlogits全体を保持しない)
     t == ignore の位置は損失に含めない。損失はトークン平均
     逆伝播ではlogitsを再計算し、Eの勾配をEmbedding側へ設定する
+    NLCPyでEが凍結中なら、VEの融合カーネル(ve_kernels.lm_ce)で損失とxの勾配を順伝播で一緒に求める
+    (logitsの計算が1回で済む。逆伝播ではgyを掛けるだけ)
     """
-    def __init__(self, embedding, tile_size=512, ignore=-100):
+    def __init__(self, embedding, tile_size=512, ignore=-100, use_kernels=True):
         super().__init__()
         self.embedding = weakref.ref(embedding) # パラメタの二重登録を避けるため弱参照
         self.tile_size = tile_size
         self.ignore = ignore
+        self.use_kernels = use_kernels
         self._wT = None
+        self.gx = None
 
     def weight(self):
         return self.embedding().parameters.w # (V, D)
@@ -597,6 +601,14 @@ class LinearLayerCrossEntropyTied(Function):
         N = xf.shape[0]
         valid = tf != self.ignore
         self.n_valid = max(int(snp.sum(valid)), 1)
+        kern = ve_kernels.get_kernels(np, xf.dtype) \
+               if self.use_kernels and self.embedding().frozen else None
+        if kern is not None:                  # 損失とxの勾配(gy=1)を一緒に求める
+            lrow, self.gx = kern.lm_ce(np.ascontiguousarray(xf), self.weight(), wT,
+                np.ascontiguousarray(np.asarray(tf), dtype='int64'),
+                self.ignore, 1.0 / self.n_valid)
+            self.x = x
+            return snp.sum(lrow) / self.n_valid
         lse = np.zeros(N, dtype=xf.dtype)     # log Σ exp(logits)
         zt = np.zeros(N, dtype=xf.dtype)      # 正解のlogit
         for s in range(0, N, self.tile_size):
@@ -610,6 +622,11 @@ class LinearLayerCrossEntropyTied(Function):
         return loss
 
     def __backward__(self, gy=1.0):
+        if self.gx is not None:               # 融合カーネルで順伝播のときに求めた勾配
+            gx, x, self.gx, self.x = self.gx, self.x, None, None
+            if float(gy) != 1.0:
+                gx *= float(gy)
+            return gx.reshape(x.shape)
         emb = self.embedding()
         w, wT = self.weight(), self.weight_t()
         x = self.x

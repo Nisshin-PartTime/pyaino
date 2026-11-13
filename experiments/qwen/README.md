@@ -13,7 +13,7 @@
 
 ## 速度（Qwen2.5-0.5B, fp32）
 - CPU（16スレッド。40スレッドでは逆に遅い）: 生成 約6 tok/s（推論専用の順伝播 `QwenInference`）、LoRA学習1ステップ（約840〜980トークン）約17〜18秒、全パラメタ 約30秒（メモリ約10GB）
-- SX-Aurora VE 1枚（NLCPy）: 生成 約70 tok/s（VEの融合カーネル）、LoRA学習1ステップ（976トークン）約1.8秒、下の LoRA 実験の学習は62秒（CPUは約7分）
+- SX-Aurora VE 1枚（NLCPy）: 生成 約70 tok/s（VEの融合カーネル）、LoRA学習1ステップ（976トークン）約1.7秒、下の LoRA 実験の学習は46秒（CPUは約7分）
   - 実行方法は `documents/pyaino_SX-Aurora対応_20261112.md`。`bash tools/sx_aurora/run_ve.sh <venv> experiments/qwen/run_experiment.py --mode lora` のように動かす
 
 ## 実験：pyaino の知識を教える（`run_experiment.py`）
